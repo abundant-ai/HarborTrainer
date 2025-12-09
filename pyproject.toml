@@ -1,0 +1,76 @@
+[project]
+name = "terminal-bench-trainer"
+version = "0.1.0"
+description = "Post-training Qwen on terminal bench using the Tinker API"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # Tinker API and cookbook
+    "tinker>=0.6.1",
+    "chz",
+    "cloudpickle",
+    
+    # Core ML
+    "torch",
+    "numpy",
+    "transformers",
+    
+    # Data handling
+    "datasets",
+    "blobfile",
+    
+    # Terminal/Container execution
+    "docker",
+    "harbor @ git+https://github.com/rishidesai/harbor.git",
+    "terminal-bench",
+    "tinker-cookbook",
+    
+    # Utilities
+    "rich",
+    "termcolor",
+    "anyio",
+    "pydantic>=2.0",
+    "tomli",
+    "openai-harmony",
+    
+    # Logging
+    "wandb",
+    "weave",
+    
+    # Environment
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+    "pyright",
+]
+
+[project.scripts]
+train = "src.train:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+python_files = ["test_*.py", "*_test.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
