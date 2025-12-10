@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -21,9 +22,13 @@ from tinker_cookbook.rl.train import (
     forward_backward as cookbook_forward_backward,
     optim_step as cookbook_optim_step,
 )
+from tinker_cookbook.rl.metrics import (
+    incorporate_kl_penalty as cookbook_incorporate_kl_penalty,
+    compute_kl_sample_train,
+)
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 from tinker_cookbook.utils import ml_log
-from tinker_cookbook.utils.misc_utils import split_list
+from tinker_cookbook.utils.misc_utils import split_list, timed, all_same
 
 from src.tinker_llm import TinkerLLM
 
@@ -32,6 +37,9 @@ logger = logging.getLogger(__name__)
 # Type aliases
 Metrics = dict[str, float | int | str]
 TrialGroup = list[TrialResult]  # Group of trials for same task (GRPO)
+
+# Small epsilon for numerical stability
+EPSILON = 1e-6
 
 
 @dataclass
@@ -53,9 +61,15 @@ class TrainerConfig:
     n_epochs: int = 1
 
     # RL hyperparameters
-    loss_fn: LossFnType = "importance_sampling"  # "importance_sampling" or "ppo"
+    loss_fn: LossFnType = "ppo"  # "ppo" (default, with clipping) or "importance_sampling"
     num_substeps: int = 1
     remove_constant_reward_groups: bool = False
+
+    # GRPO advantage normalization
+    normalize_advantages_by_std: bool = True  # Divide advantages by std
+
+    # KL regularization against reference model
+    kl_penalty_coef: float = 0.001  # KL penalty coefficient (0 = disabled)
 
     # Agent configuration
     max_turns: int | None = None
@@ -86,27 +100,69 @@ def extract_reward(verifier_result) -> float:
     return 1.0 if pass_value else 0.0
 
 
-def compute_grpo_advantages(groups: list[TrialGroup]) -> list[list[float]]:
-    """Compute GRPO-style advantages: center rewards within each group."""
+def compute_grpo_advantages(
+    groups: list[TrialGroup],
+    normalize_by_std: bool = True,
+) -> tuple[list[list[float]], Metrics]:
+    """
+    Compute GRPO-style advantages: center rewards within each group.
+    
+    Args:
+        groups: List of trial groups (each group = multiple rollouts for same task)
+        normalize_by_std: If True, divide by std
+    
+    Returns:
+        Tuple of (advantages per group, metrics dict)
+    """
     all_advantages: list[list[float]] = []
+    all_stds: list[float] = []
 
     for group in groups:
         rewards = [extract_reward(r.verifier_result) for r in group]
         if not rewards:
             all_advantages.append([])
             continue
+        
         mean_reward = sum(rewards) / len(rewards)
-        advantages = [r - mean_reward for r in rewards]
+        
+        if normalize_by_std and len(rewards) > 1:
+            # Compute std for normalization (like SkyRL)
+            std_reward = statistics.stdev(rewards)
+            all_stds.append(std_reward)
+            # Normalize: (r - mean) / (std + epsilon)
+            advantages = [(r - mean_reward) / (std_reward + EPSILON) for r in rewards]
+        else:
+            # Simple mean centering (original behavior)
+            advantages = [r - mean_reward for r in rewards]
+        
         all_advantages.append(advantages)
 
-    return all_advantages
+    # Compute metrics about advantage distribution
+    flat_advantages = [a for group_adv in all_advantages for a in group_adv]
+    metrics: Metrics = {}
+    if flat_advantages:
+        metrics["advantage/mean"] = sum(flat_advantages) / len(flat_advantages)
+        if len(flat_advantages) > 1:
+            metrics["advantage/std"] = statistics.stdev(flat_advantages)
+        if all_stds:
+            metrics["advantage/avg_group_std"] = sum(all_stds) / len(all_stds)
+
+    return all_advantages, metrics
 
 
 def build_datums_from_trials(
         groups: list[TrialGroup],
         advantages_per_group: list[list[float]],
 ) -> list[tinker.Datum]:
-    """Build tinker.Datum directly from TrialResult rollout_details."""
+    """
+    Build tinker.Datum directly from TrialResult rollout_details.
+    
+    Creates datums with:
+    - target_tokens: The completion tokens to predict
+    - logprobs: Log probabilities from sampling (for importance sampling/PPO)
+    - advantages: Per-token advantages (normalized by turn count)
+    - mask: All 1s for completion tokens (we train on all assistant output)
+    """
     datums: list[tinker.Datum] = []
 
     for group, group_advantages in zip(groups, advantages_per_group):
@@ -141,14 +197,26 @@ def build_datums_from_trials(
                 if not turn_completion or not turn_logprobs:
                     continue
 
-                token_advantages = [normalized_advantage] * len(turn_completion)
+                n_tokens = len(turn_completion)
+                token_advantages = [normalized_advantage] * n_tokens
+                # Mask: all 1s because completion_token_ids are pure model output
+                token_mask = [1.0] * n_tokens
 
                 datum = tinker.Datum(
                     model_input=tinker.ModelInput.from_ints(tokens=turn_prompt),
                     loss_fn_inputs={
-                        "target_tokens": turn_completion,
-                        "logprobs": turn_logprobs,
-                        "advantages": token_advantages,
+                        "target_tokens": tinker.TensorData.from_torch(
+                            torch.tensor(turn_completion)
+                        ),
+                        "logprobs": tinker.TensorData.from_torch(
+                            torch.tensor(turn_logprobs)
+                        ),
+                        "advantages": tinker.TensorData.from_torch(
+                            torch.tensor(token_advantages)
+                        ),
+                        "mask": tinker.TensorData.from_torch(
+                            torch.tensor(token_mask)
+                        ),
                     },
                 )
                 datums.append(datum)
@@ -194,6 +262,7 @@ class Terminus2RLTrainer:
         self._service_client: tinker.ServiceClient | None = None
         self._training_client: tinker.TrainingClient | None = None
         self._sampling_client: tinker.SamplingClient | None = None
+        self._base_sampling_client: tinker.SamplingClient | None = None
         self._tokenizer = None
         self._renderer = None
         self._batch_count = 0
@@ -223,10 +292,18 @@ class Terminus2RLTrainer:
         self._sampling_client = await self._training_client.save_weights_and_get_sampling_client_async(
             name="initial"
         )
+        
+        # Store frozen reference model for KL penalty
+        if self.config.kl_penalty_coef > 0:
+            self._base_sampling_client = await self._training_client.save_weights_and_get_sampling_client_async(
+                name="reference_base"
+            )
+            logger.info(f"KL regularization enabled with coef={self.config.kl_penalty_coef}")
 
         self._semaphore = asyncio.Semaphore(self.config.n_parallel_envs)
         self._batch_count = 0
         logger.info(f"Initialized Terminus2RLTrainer with model {self.config.model_name}")
+        logger.info(f"Loss function: {self.config.loss_fn}, Std normalization: {self.config.normalize_advantages_by_std}")
 
     def _create_llm(self) -> TinkerLLM:
         """Factory function to create TinkerLLM instances."""
@@ -349,11 +426,11 @@ class Terminus2RLTrainer:
         if not groups:
             return {"error": "All trial groups failed"}
 
-        # Optionally remove constant reward groups
+        # Optionally remove constant reward groups (no gradient when all same)
         if self.config.remove_constant_reward_groups:
             groups = [
                 g for g in groups
-                if len(set(extract_reward(r.verifier_result) for r in g)) > 1
+                if not all_same([extract_reward(r.verifier_result) for r in g])
             ]
             if not groups:
                 return {"error": "All groups had constant rewards"}
@@ -361,8 +438,11 @@ class Terminus2RLTrainer:
         # Get metrics after filtering
         episode_metrics = compute_batch_metrics(groups)
 
-        # Step 2: Compute GRPO advantages
-        advantages = compute_grpo_advantages(groups)
+        # Step 2: Compute GRPO advantages (with optional std normalization)
+        advantages, advantage_metrics = compute_grpo_advantages(
+            groups, 
+            normalize_by_std=self.config.normalize_advantages_by_std
+        )
 
         # Step 3: Build Datums from TrialResult
         datums = build_datums_from_trials(groups, advantages)
@@ -370,12 +450,33 @@ class Terminus2RLTrainer:
         if not datums:
             return {"error": "No training data generated", **episode_metrics}
 
-        # Step 4: Train via Tinker
-        minibatches = split_list(datums, min(self.config.num_substeps, len(datums)))
+        # Step 4: Apply KL penalty against reference model (if enabled)
+        # Uses cookbook's incorporate_kl_penalty which modifies advantages in-place
+        kl_metrics: Metrics = {}
+        if self.config.kl_penalty_coef > 0 and self._base_sampling_client is not None:
+            kl_metrics = await cookbook_incorporate_kl_penalty(
+                datums,
+                self._base_sampling_client,
+                self.config.kl_penalty_coef,
+                kl_discount_factor=0.0,  # No temporal discounting
+            )
+            kl_metrics["kl/penalty_coef"] = self.config.kl_penalty_coef
 
-        for batch in minibatches:
-            await self._forward_backward(batch)
-        await self._optim_step()
+        # Step 5: Train via Tinker
+        minibatches = split_list(datums, min(self.config.num_substeps, len(datums)))
+        timing_metrics: Metrics = {}
+
+        training_logprobs_D: list[torch.Tensor] = []
+        with timed("forward_backward", timing_metrics):
+            for batch in minibatches:
+                batch_logprobs = await self._forward_backward(batch)
+                training_logprobs_D.extend(batch_logprobs)
+        
+        with timed("optim_step", timing_metrics):
+            await self._optim_step()
+        
+        # Compute KL between sampling and training (measures staleness)
+        optim_metrics = compute_kl_sample_train(datums, training_logprobs_D)
 
         if self._training_client is None:
             raise RuntimeError("Trainer not initialized")
@@ -394,6 +495,10 @@ class Terminus2RLTrainer:
 
         return {
             **episode_metrics,
+            **advantage_metrics,
+            **kl_metrics,
+            **optim_metrics,
+            **timing_metrics,
             "n_datums": len(datums),
             "n_minibatches": len(minibatches),
             "loss_fn": self.config.loss_fn,
