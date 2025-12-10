@@ -10,7 +10,6 @@ from typing import Any
 
 import tinker
 import torch
-import resource
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.task.task import Task
 from harbor.models.trial.config import AgentConfig, EnvironmentConfig, TaskConfig, TrialConfig
@@ -307,29 +306,6 @@ class Terminus2RLTrainer:
 
     async def setup(self) -> None:
         """Initialize Tinker clients."""
-        # Check file descriptor limits
-        try:
-            soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
-            recommended_limit = self.config.n_parallel_envs * self.config.group_size * 20
-            
-            if soft_limit < recommended_limit:
-                logger.warning(
-                    f"System file descriptor limit ({soft_limit}) may be too low for "
-                    f"{self.config.n_parallel_envs} parallel environments × "
-                    f"{self.config.group_size} trials per task. "
-                    f"Recommended: {recommended_limit}. "
-                    f"Attempting to increase to {min(recommended_limit, hard_limit)}..."
-                )
-                try:
-                    resource.setrlimit(resource.RLIMIT_NOFILE, (min(recommended_limit, hard_limit), hard_limit))
-                    new_soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
-                    logger.info(f"Increased file descriptor limit to {new_soft}")
-                except Exception as e:
-                    logger.error(f"Failed to increase file descriptor limit: {e}")
-                    logger.error("Consider running: ulimit -n 65536")
-        except Exception as e:
-            logger.warning(f"Could not check file descriptor limits: {e}")
-        
         # Suppress verbose Harbor logs at the module level
         logging.getLogger("harbor").setLevel(logging.WARNING)
         logging.getLogger("harbor.utils.logger").setLevel(logging.WARNING)
@@ -413,7 +389,6 @@ class Terminus2RLTrainer:
             raise RuntimeError("Trainer not initialized")
 
         async with self._semaphore:
-            trial = None
             try:
                 trial = Trial(self._create_trial_config(task))
                 if self.config.trial_timeout_sec is not None:
@@ -430,31 +405,6 @@ class Terminus2RLTrainer:
             except Exception as e:
                 logger.error(f"Trial failed for {task.task_id}: {e}", exc_info=False)
                 return None
-            finally:
-                # Critical cleanup to prevent file descriptor leaks
-                if trial is not None:
-                    # 1. Close logger file handlers (major source of FD leaks)
-                    if hasattr(trial, '_logger') and trial._logger is not None:
-                        for handler in trial._logger.handlers[:]:
-                            try:
-                                handler.close()
-                                trial._logger.removeHandler(handler)
-                            except Exception:
-                                pass
-                    
-                    # Note: Don't call environment.stop() here - Trial.run() already handles
-                    # cleanup in its own finally block via _cleanup_and_finalize().
-                    # Calling it twice can cause issues. We just clear references.
-                    
-                    # 2. Clear references to free resources
-                    if hasattr(trial, '_environment'):
-                        trial._environment = None
-                    if hasattr(trial, '_agent'):
-                        trial._agent = None
-                
-                # Force garbage collection to close any remaining leaked file descriptors
-                import gc
-                gc.collect()
 
     async def _run_group(self, task: Task) -> TrialGroup:
         """Run multiple trials for same task (GRPO grouping)."""
