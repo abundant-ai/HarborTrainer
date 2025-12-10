@@ -161,11 +161,12 @@ def build_datums_from_trials(
     """
     Build tinker.Datum directly from TrialResult rollout_details.
     
-    Creates datums with:
-    - target_tokens: The completion tokens to predict
-    - logprobs: Log probabilities from sampling (for importance sampling/PPO)
-    - advantages: Per-token advantages (normalized by turn count)
-    - mask: All 1s for completion tokens (we train on all assistant output)
+    Tinker expects causal LM format where all arrays have the same length:
+    - model_input: full_sequence[:-1] (prompt + completion, minus last token)
+    - target_tokens: full_sequence[1:] (shifted by 1 position)
+    - logprobs: same length, with 0s for prompt positions
+    - advantages: same length, with 0s for prompt positions
+    - mask: 0s for prompt positions, 1s for completion positions
     """
     datums: list[tinker.Datum] = []
 
@@ -183,9 +184,14 @@ def build_datums_from_trials(
             if n_turns == 0:
                 continue
 
-            # Normalize advantage by turn count so each episode contributes
-            # equally regardless of how many turns it took
-            normalized_advantage = advantage / n_turns
+            # Calculate total completion tokens for this episode
+            total_completion_tokens = sum(len(tokens) for tokens in completion_tokens)
+            if total_completion_tokens == 0:
+                continue
+
+            # Normalize advantage by total completion tokens so each episode contributes
+            # equally regardless of how many tokens it generated
+            normalized_advantage = advantage / total_completion_tokens
 
             # Build one datum per turn
             for turn_idx in range(n_turns):
@@ -201,25 +207,50 @@ def build_datums_from_trials(
                 if not turn_completion or not turn_logprobs:
                     continue
 
-                n_tokens = len(turn_completion)
-                token_advantages = [normalized_advantage] * n_tokens
-                # Mask: all 1s because completion_token_ids are pure model output
-                token_mask = [1.0] * n_tokens
+                # Concatenate prompt + completion to form full sequence
+                full_sequence = turn_prompt + turn_completion
+                
+                if len(full_sequence) < 2:
+                    continue
+                
+                # Causal LM format: input is all but last, target is shifted by 1
+                input_tokens = full_sequence[:-1]
+                target_tokens = full_sequence[1:]
+                
+                n_prompt = len(turn_prompt)
+                n_completion = len(turn_completion)
+                seq_len = len(input_tokens)  # = len(full_sequence) - 1
+                
+                # Build logprobs array:
+                # - Positions 0 to n_prompt-2: predicting prompt tokens (no logprobs, use 0)
+                # - Position n_prompt-1: predicting first completion token (logprobs[0])
+                # - Positions n_prompt to seq_len-1: predicting rest of completion (logprobs[1:])
+                full_logprobs = [0.0] * (n_prompt - 1) + turn_logprobs
+                
+                # Build advantages array: 0 for prompt positions, normalized_advantage for completion
+                full_advantages = [0.0] * (n_prompt - 1) + [normalized_advantage] * n_completion
+                
+                # Build mask: 0 for prompt positions, 1 for completion positions
+                full_mask = [0.0] * (n_prompt - 1) + [1.0] * n_completion
+                
+                # Verify lengths match
+                assert len(input_tokens) == len(target_tokens) == len(full_logprobs) == len(full_advantages) == len(full_mask), \
+                    f"Length mismatch: input={len(input_tokens)}, target={len(target_tokens)}, logprobs={len(full_logprobs)}, advantages={len(full_advantages)}, mask={len(full_mask)}"
 
                 datum = tinker.Datum(
-                    model_input=tinker.ModelInput.from_ints(tokens=turn_prompt),
+                    model_input=tinker.ModelInput.from_ints(tokens=input_tokens),
                     loss_fn_inputs={
                         "target_tokens": tinker.TensorData.from_torch(
-                            torch.tensor(turn_completion)
+                            torch.tensor(target_tokens)
                         ),
                         "logprobs": tinker.TensorData.from_torch(
-                            torch.tensor(turn_logprobs)
+                            torch.tensor(full_logprobs)
                         ),
                         "advantages": tinker.TensorData.from_torch(
-                            torch.tensor(token_advantages)
+                            torch.tensor(full_advantages)
                         ),
                         "mask": tinker.TensorData.from_torch(
-                            torch.tensor(token_mask)
+                            torch.tensor(full_mask)
                         ),
                     },
                 )
