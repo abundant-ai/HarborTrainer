@@ -55,9 +55,9 @@ class TrainerConfig:
     lora_rank: int = 32
 
     # Training hyperparameters
-    learning_rate: float = 5e-5
-    batch_size: int = 8  # Tasks per batch
-    group_size: int = 4  # Rollouts per task (GRPO group size)
+    learning_rate: float = 5e-4
+    batch_size: int = 1  # Tasks per batch
+    group_size: int = 8  # Rollouts per task (GRPO group size)
     n_epochs: int = 1
 
     # RL hyperparameters
@@ -74,18 +74,18 @@ class TrainerConfig:
     # Agent configuration
     max_turns: int | None = None
     temperature: float = 0.7
-    max_tokens: int = 4096
-    context_limit: int = 128000
+    max_tokens: int = 1024
+    context_limit: int = 32000  # required by Tinker :(
     trial_timeout_sec: float | None = None
 
     # Context summarization (enables parity with Terminus 2 evaluation)
     enable_summarize: bool = True  # Enable context summarization when context is full
-    proactive_summarization_threshold: int = 8000  # Trigger summarization when free tokens below this
+    proactive_summarization_threshold: int = 2000  # Trigger summarization when free tokens below this
 
     # Environment configuration
     environment_type: str = "docker"
     environment_kwargs: dict[str, Any] = field(default_factory=dict)
-    n_parallel_envs: int = 1
+    n_parallel_envs: int = 8
 
     # Logging
     wandb_project: str | None = None

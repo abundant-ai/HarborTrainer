@@ -20,7 +20,7 @@ class CLIConfig:
     """CLI configuration for Terminus2 RL training."""
 
     # Required
-    model_name: str = chz.field(doc="Model name (e.g., 'meta-llama/Llama-3.1-8B')")
+    model_name: str = chz.field(doc="Model name (e.g., 'deepseek-ai/DeepSeek-V3.1')")
     tasks_dir: str = chz.field(doc="Directory containing Harbor tasks")
 
     # Directories
@@ -35,14 +35,14 @@ class CLIConfig:
     lora_rank: int = chz.field(default=32, doc="LoRA rank")
 
     # Training hyperparameters
-    learning_rate: float = chz.field(default=5e-5, doc="Learning rate")
-    batch_size: int = chz.field(default=8, doc="Tasks per batch")
-    group_size: int = chz.field(default=4, doc="Rollouts per task (GRPO group size)")
+    learning_rate: float = chz.field(default=5e-4, doc="Learning rate")
+    batch_size: int = chz.field(default=1, doc="Tasks per batch")
+    group_size: int = chz.field(default=8, doc="Rollouts per task (GRPO group size)")
     n_epochs: int = chz.field(default=1, doc="Number of epochs")
 
     # RL hyperparameters
     loss_fn: Literal["importance_sampling", "ppo"] = chz.field(
-        default="importance_sampling",
+        default="ppo",
         doc="Loss function: 'importance_sampling' (REINFORCE) or 'ppo'",
     )
     num_substeps: int = chz.field(
@@ -63,10 +63,13 @@ class CLIConfig:
     )
 
     # Agent configuration
-    max_turns: int | None = chz.field(default=None, doc="Max agent turns (None = unlimited)")
+    max_turns: int | None = chz.field(
+        default=50,
+        doc="Max agent turns (None = unlimited)",
+    )
     temperature: float = chz.field(default=0.7, doc="Sampling temperature")
-    max_tokens: int = chz.field(default=4096, doc="Max tokens per generation")
-    context_limit: int = chz.field(default=128000, doc="Model context limit")
+    max_tokens: int = chz.field(default=1024, doc="Max tokens per generation")
+    context_limit: int = chz.field(default=32000, doc="Model context limit")
 
     enable_summarize: bool = chz.field(
         default=True,
@@ -92,7 +95,7 @@ class CLIConfig:
         ),
     )
     n_parallel_envs: int = chz.field(
-        default=1,
+        default=8,
         doc="Parallel environments. Keep low (1-2) for docker, higher for cloud",
     )
     trial_timeout_sec: float | None = chz.field(
