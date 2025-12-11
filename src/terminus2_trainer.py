@@ -50,6 +50,10 @@ class TrainerConfig:
     tasks_dir: Path
     logs_dir: Path
 
+    # Backend selection
+    backend: str = "tinker"  # "tinker" (cloud API) or "skyrl-tx" (self-hosted)
+    skyrl_tx_url: str | None = None  # URL for skyrl-tx server (e.g., "http://localhost:8000")
+
     # Tinker configuration
     tinker_base_url: str | None = None
     lora_rank: int = 32
@@ -315,7 +319,23 @@ class Terminus2RLTrainer:
         logging.getLogger("harbor").setLevel(logging.WARNING)
         logging.getLogger("harbor.utils.logger").setLevel(logging.WARNING)
         
-        self._service_client = tinker.ServiceClient(base_url=self.config.tinker_base_url)
+        # Select backend URL based on configuration
+        if self.config.backend == "skyrl-tx":
+            if not self.config.skyrl_tx_url:
+                raise ValueError("skyrl_tx_url is required when backend='skyrl-tx'")
+            base_url = self.config.skyrl_tx_url
+            logger.info(f"Using skyrl-tx backend at {base_url}")
+            # Validate model compatibility for skyrl-tx (currently only Qwen3)
+            if not any(self.config.model_name.lower().startswith(p) for p in ["qwen/qwen3", "qwen3"]):
+                logger.warning(
+                    f"Model {self.config.model_name} may not be supported by skyrl-tx. "
+                    f"Currently supported: Qwen3 family. Consider using backend='tinker'."
+                )
+        else:
+            base_url = self.config.tinker_base_url
+            logger.info(f"Using Tinker backend" + (f" at {base_url}" if base_url else " (default cloud)"))
+        
+        self._service_client = tinker.ServiceClient(base_url=base_url)
 
         if hasattr(self._service_client, "create_lora_training_client_async"):
             self._training_client = await self._service_client.create_lora_training_client_async(
