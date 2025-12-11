@@ -1,0 +1,3 @@
+[submodule "SkyRL"]
+	path = SkyRL
+	url = https://github.com/RishiDesai/SkyRL.git
