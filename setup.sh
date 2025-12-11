@@ -81,7 +81,38 @@ fi
 # 5. Check for Docker and Docker Compose V2
 echo -e "\n${GREEN}[5/6] Checking Docker...${NC}"
 if ! command -v docker &> /dev/null; then
-    echo -e "${YELLOW}⚠️  Docker is not installed. Please install Docker to continue.${NC}"
+    echo -e "${YELLOW}⚠️  Docker is not installed. Installing Docker...${NC}"
+    
+    # Try to install Docker on Ubuntu/Debian systems
+    if command -v apt-get &> /dev/null; then
+        echo "Updating package list..."
+        sudo apt-get update -qq
+        echo "Installing docker.io..."
+        if sudo apt-get install -y docker.io; then
+            echo "✓ Docker installed successfully"
+            
+            # Start Docker service
+            echo "Starting Docker service..."
+            sudo systemctl start docker
+            sudo systemctl enable docker
+            
+            # Add user to docker group
+            echo "Adding $USER to docker group..."
+            sudo usermod -aG docker "$USER"
+            echo -e "${YELLOW}⚠️  You may need to log out and back in, or run: newgrp docker${NC}"
+            
+            # Try to fix permissions for current session
+            sudo chmod 666 /var/run/docker.sock 2>/dev/null
+        else
+            echo -e "${YELLOW}⚠️  Failed to install Docker automatically.${NC}"
+            echo "   Please install Docker manually and re-run this script."
+            echo "   See: https://docs.docker.com/engine/install/"
+        fi
+    else
+        echo -e "${YELLOW}⚠️  Cannot install Docker automatically on this system.${NC}"
+        echo "   Please install Docker manually:"
+        echo "   https://docs.docker.com/engine/install/"
+    fi
 else
     echo "✓ Docker is installed"
     
@@ -107,8 +138,10 @@ else
             echo -e "${YELLOW}   Docker daemon may not be running. Please start Docker.${NC}"
         fi
     fi
-    
-    # Check for Docker Compose V2 (required by Harbor)
+fi
+
+# Check for Docker Compose V2 (required by Harbor) - must run after Docker is installed
+if command -v docker &> /dev/null; then
     if docker compose version &> /dev/null; then
         COMPOSE_VERSION=$(docker compose version --short 2>/dev/null || docker compose version | grep -oP '\d+\.\d+\.\d+' | head -1)
         echo "✓ Docker Compose V2 is installed (version: ${COMPOSE_VERSION})"
@@ -116,7 +149,7 @@ else
         echo -e "${YELLOW}⚠️  Docker Compose V2 not found. Installing...${NC}"
         # Try Ubuntu/Debian package first
         if command -v apt-get &> /dev/null; then
-            if sudo apt-get update -qq && sudo apt-get install -y docker-compose-v2 2>/dev/null; then
+            if sudo apt-get update -qq && sudo apt-get install -y docker-compose-v2; then
                 echo "✓ Docker Compose V2 installed via apt"
             else
                 echo -e "${YELLOW}   Could not install docker-compose-v2 via apt.${NC}"
