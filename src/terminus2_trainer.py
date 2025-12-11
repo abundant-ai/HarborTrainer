@@ -258,7 +258,7 @@ def build_datums_from_trials(
                         "advantages": tinker.TensorData.from_torch(
                             torch.tensor(full_advantages)
                         ),
-                        "mask": tinker.TensorData.from_torch(
+                        "weights": tinker.TensorData.from_torch(
                             torch.tensor(full_mask)
                         ),
                     },
@@ -307,6 +307,7 @@ class Terminus2RLTrainer:
         self._training_client: tinker.TrainingClient | None = None
         self._sampling_client: tinker.SamplingClient | None = None
         self._base_sampling_client: tinker.SamplingClient | None = None
+        self._effective_kl_coef: float = 0.0  # Set properly in setup()
         self._tokenizer = None
         self._renderer = None
         self._batch_count = 0
@@ -326,7 +327,9 @@ class Terminus2RLTrainer:
             base_url = self.config.skyrl_tx_url
             logger.info(f"Using skyrl-tx backend at {base_url}")
             # Validate model compatibility for skyrl-tx (currently only Qwen3)
-            if not any(self.config.model_name.lower().startswith(p) for p in ["qwen/qwen3", "qwen3"]):
+            model_lower = self.config.model_name.lower()
+            supported_patterns = ["qwen/qwen3", "qwen3-", "qwen3_"]
+            if not any(p in model_lower for p in supported_patterns):
                 logger.warning(
                     f"Model {self.config.model_name} may not be supported by skyrl-tx. "
                     f"Currently supported: Qwen3 family. Consider using backend='tinker'."
@@ -365,20 +368,22 @@ class Terminus2RLTrainer:
             )
             
             self._base_sampling_client = None
+            # KL penalty not supported with skyrl-tx - track effective value without mutating config
+            self._effective_kl_coef = 0.0
             if self.config.kl_penalty_coef > 0:
                 logger.warning("KL penalty not fully tested with skyrl-tx, disabling for safety")
-                self.config.kl_penalty_coef = 0.0
         else:
             # For Tinker cloud, use the standard API with ephemeral saves
             self._sampling_client = await self._training_client.save_weights_and_get_sampling_client_async(
                 name="initial"
             )
             # Store frozen reference model for KL penalty
-            if self.config.kl_penalty_coef > 0:
+            self._effective_kl_coef = self.config.kl_penalty_coef
+            if self._effective_kl_coef > 0:
                 self._base_sampling_client = await self._training_client.save_weights_and_get_sampling_client_async(
                     name="reference_base"
                 )
-                logger.info(f"KL regularization enabled with coef={self.config.kl_penalty_coef}")
+                logger.info(f"KL regularization enabled with coef={self._effective_kl_coef}")
             else:
                 self._base_sampling_client = None
 
@@ -449,12 +454,18 @@ class Terminus2RLTrainer:
                 logger.error(f"Trial failed for {task.task_id}: {e}", exc_info=False)
                 return None
 
-    async def _run_group(self, task: Task) -> TrialGroup:
-        """Run multiple trials for same task (GRPO grouping)."""
-        logger.info(f"    Running {self.config.group_size} trials for task: {task.task_id}")
+    async def _run_group(self, task: Task, group_size: int | None = None) -> TrialGroup:
+        """Run multiple trials for same task (GRPO grouping).
+        
+        Args:
+            task: The task to run trials for
+            group_size: Number of trials to run. Defaults to config.group_size if None.
+        """
+        effective_group_size = group_size if group_size is not None else self.config.group_size
+        logger.info(f"    Running {effective_group_size} trials for task: {task.task_id}")
         
         results = await asyncio.gather(
-            *[self._run_trial(task) for _ in range(self.config.group_size)],
+            *[self._run_trial(task) for _ in range(effective_group_size)],
             return_exceptions=True,
         )
 
@@ -483,13 +494,18 @@ class Terminus2RLTrainer:
 
         return valid
 
-    async def _run_batch(self, tasks: list[Task]) -> list[TrialGroup]:
-        """Run trials for a batch of tasks."""
+    async def _run_batch(self, tasks: list[Task], group_size: int | None = None) -> list[TrialGroup]:
+        """Run trials for a batch of tasks.
+        
+        Args:
+            tasks: List of tasks to run
+            group_size: Number of trials per task. Defaults to config.group_size if None.
+        """
         # Suppress Harbor logs before running trials (in case new loggers were created)
         self._suppress_harbor_logs()
         
         groups = await asyncio.gather(
-            *[self._run_group(task) for task in tasks],
+            *[self._run_group(task, group_size=group_size) for task in tasks],
             return_exceptions=True,
         )
 
@@ -524,35 +540,29 @@ class Terminus2RLTrainer:
         
         Uses eval_group_size if set, otherwise uses group_size.
         """
-        # Temporarily override group_size for eval if eval_group_size is set
-        original_group_size = self.config.group_size
-        if self.config.eval_group_size is not None:
-            self.config.group_size = self.config.eval_group_size
+        # Use eval_group_size if specified, otherwise use regular group_size
+        effective_group_size = self.config.eval_group_size or self.config.group_size
         
-        try:
-            # Collect trials (no training)
-            groups = await self._run_batch(tasks)
-            
-            if not groups:
-                return {"error": "All trial groups failed"}
-            
-            # Compute metrics only (no training)
-            episode_metrics = compute_batch_metrics(groups)
-            
-            # Optionally compute advantages for analysis
-            advantages, advantage_metrics = compute_grpo_advantages(
-                groups,
-                normalize_by_std=self.config.normalize_advantages_by_std
-            )
-            
-            return {
-                **episode_metrics,
-                **advantage_metrics,
-                "n_groups": len(groups),
-            }
-        finally:
-            # Restore original group_size
-            self.config.group_size = original_group_size
+        # Collect trials (no training)
+        groups = await self._run_batch(tasks, group_size=effective_group_size)
+        
+        if not groups:
+            return {"error": "All trial groups failed"}
+        
+        # Compute metrics only (no training)
+        episode_metrics = compute_batch_metrics(groups)
+        
+        # Optionally compute advantages for analysis
+        advantages, advantage_metrics = compute_grpo_advantages(
+            groups,
+            normalize_by_std=self.config.normalize_advantages_by_std
+        )
+        
+        return {
+            **episode_metrics,
+            **advantage_metrics,
+            "n_groups": len(groups),
+        }
 
     async def train_batch(self, tasks: list[Task]) -> dict[str, Any]:
         """Train on a batch of tasks."""
@@ -589,14 +599,14 @@ class Terminus2RLTrainer:
         # Step 4: Apply KL penalty against reference model (if enabled)
         # Uses cookbook's incorporate_kl_penalty which modifies advantages in-place
         kl_metrics: Metrics = {}
-        if self.config.kl_penalty_coef > 0 and self._base_sampling_client is not None:
+        if self._effective_kl_coef > 0 and self._base_sampling_client is not None:
             kl_metrics = await cookbook_incorporate_kl_penalty(
                 datums,
                 self._base_sampling_client,
-                self.config.kl_penalty_coef,
+                self._effective_kl_coef,
                 kl_discount_factor=0.0,  # No temporal discounting
             )
-            kl_metrics["kl/penalty_coef"] = self.config.kl_penalty_coef
+            kl_metrics["kl/penalty_coef"] = self._effective_kl_coef
 
         # Step 5: Train via Tinker
         minibatches = split_list(datums, min(self.config.num_substeps, len(datums)))
