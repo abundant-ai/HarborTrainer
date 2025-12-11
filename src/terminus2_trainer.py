@@ -60,6 +60,11 @@ class TrainerConfig:
     group_size: int = 8  # Rollouts per task (GRPO group size)
     n_epochs: int = 1
 
+    # Train/Eval split
+    eval_split: float = 0.2  # Fraction of tasks to use for evaluation (0.0 = no eval)
+    eval_tasks: list[str] | None = None  # Optional: specific task IDs for eval (overrides eval_split)
+    eval_group_size: int | None = None  # Rollouts per task during eval (None = use group_size)
+
     # RL hyperparameters
     loss_fn: LossFnType = "ppo"  # "ppo" (default, with clipping) or "importance_sampling"
     num_substeps: int = 1
@@ -475,6 +480,42 @@ class Terminus2RLTrainer:
             raise RuntimeError("Trainer not initialized")
         await cookbook_optim_step(self._training_client, self.config.learning_rate)
 
+    async def eval_batch(self, tasks: list[Task]) -> dict[str, Any]:
+        """
+        Evaluate on a batch of tasks without training.
+        
+        Uses eval_group_size if set, otherwise uses group_size.
+        """
+        # Temporarily override group_size for eval if eval_group_size is set
+        original_group_size = self.config.group_size
+        if self.config.eval_group_size is not None:
+            self.config.group_size = self.config.eval_group_size
+        
+        try:
+            # Collect trials (no training)
+            groups = await self._run_batch(tasks)
+            
+            if not groups:
+                return {"error": "All trial groups failed"}
+            
+            # Compute metrics only (no training)
+            episode_metrics = compute_batch_metrics(groups)
+            
+            # Optionally compute advantages for analysis
+            advantages, advantage_metrics = compute_grpo_advantages(
+                groups,
+                normalize_by_std=self.config.normalize_advantages_by_std
+            )
+            
+            return {
+                **episode_metrics,
+                **advantage_metrics,
+                "n_groups": len(groups),
+            }
+        finally:
+            # Restore original group_size
+            self.config.group_size = original_group_size
+
     async def train_batch(self, tasks: list[Task]) -> dict[str, Any]:
         """Train on a batch of tasks."""
         # Step 1: Collect trials using Harbor's Trial
@@ -585,45 +626,135 @@ class Terminus2RLTrainer:
         # Suppress verbose Harbor logs before running trials
         self._suppress_harbor_logs()
 
-        tasks = self._load_tasks()
-        logger.info(f"Loaded {len(tasks)} tasks from {self.config.tasks_dir}")
+        train_tasks, eval_tasks = self._load_tasks()
+        logger.info(f"Loaded {len(train_tasks)} train tasks, {len(eval_tasks)} eval tasks from {self.config.tasks_dir}")
 
-        if not tasks:
-            logger.error("No tasks found")
+        if not train_tasks:
+            logger.error("No train tasks found")
             if self._ml_logger:
                 self._ml_logger.close()
             return
 
         for epoch in range(self.config.n_epochs):
             logger.info(f"Epoch {epoch + 1}/{self.config.n_epochs}")
-            random.shuffle(tasks)
+            random.shuffle(train_tasks)
 
-            for i in range(0, len(tasks), self.config.batch_size):
-                batch_tasks = tasks[i: i + self.config.batch_size]
+            # Training loop
+            for i in range(0, len(train_tasks), self.config.batch_size):
+                batch_tasks = train_tasks[i: i + self.config.batch_size]
                 batch_num = i // self.config.batch_size + 1
-                total_batches = (len(tasks) + self.config.batch_size - 1) // self.config.batch_size
+                total_batches = (len(train_tasks) + self.config.batch_size - 1) // self.config.batch_size
 
-                logger.info(f"  Batch {batch_num}/{total_batches}")
+                logger.info(f"  Train Batch {batch_num}/{total_batches}")
 
                 metrics = await self.train_batch(batch_tasks)
                 metrics["epoch"] = epoch + 1
                 metrics["batch"] = batch_num
+                metrics["split"] = "train"
 
-                logger.info(f"    Metrics: {metrics}")
+                logger.info(f"    Train Metrics: {metrics}")
 
                 if self._ml_logger:
                     self._ml_logger.log_metrics(metrics, step=self._batch_count)
 
+            # Evaluation at end of epoch
+            if eval_tasks:
+                logger.info(f"  Running evaluation on {len(eval_tasks)} tasks...")
+                eval_metrics_list = []
+                
+                for i in range(0, len(eval_tasks), self.config.batch_size):
+                    batch_tasks = eval_tasks[i: i + self.config.batch_size]
+                    batch_num = i // self.config.batch_size + 1
+                    total_batches = (len(eval_tasks) + self.config.batch_size - 1) // self.config.batch_size
+                    
+                    logger.info(f"  Eval Batch {batch_num}/{total_batches}")
+                    
+                    eval_metrics = await self.eval_batch(batch_tasks)
+                    eval_metrics["epoch"] = epoch + 1
+                    eval_metrics["batch"] = batch_num
+                    eval_metrics["split"] = "eval"
+                    
+                    logger.info(f"    Eval Metrics: {eval_metrics}")
+                    eval_metrics_list.append(eval_metrics)
+                
+                # Aggregate eval metrics
+                if eval_metrics_list:
+                    agg_eval_metrics = self._aggregate_eval_metrics(eval_metrics_list)
+                    agg_eval_metrics["epoch"] = epoch + 1
+                    agg_eval_metrics["split"] = "eval_aggregated"
+                    
+                    logger.info(f"  Epoch {epoch + 1} Eval Summary: {agg_eval_metrics}")
+                    
+                    if self._ml_logger:
+                        self._ml_logger.log_metrics(agg_eval_metrics, step=self._batch_count)
+
         if self._ml_logger:
             self._ml_logger.close()
+    
+    def _aggregate_eval_metrics(self, metrics_list: list[dict[str, Any]]) -> dict[str, Any]:
+        """Aggregate evaluation metrics across batches."""
+        if not metrics_list:
+            return {}
+        
+        # Count total episodes
+        total_episodes = sum(m.get("n_episodes", 0) for m in metrics_list)
+        
+        if total_episodes == 0:
+            return {"error": "No episodes in eval"}
+        
+        # Weighted average of metrics
+        agg = {}
+        for key in ["mean_reward", "success_rate", "mean_turns"]:
+            weighted_sum = sum(
+                m.get(key, 0) * m.get("n_episodes", 0)
+                for m in metrics_list
+            )
+            agg[key] = weighted_sum / total_episodes
+        
+        agg["n_episodes"] = total_episodes
+        agg["n_batches"] = len(metrics_list)
+        
+        return agg
 
-    def _load_tasks(self) -> list[Task]:
-        """Load tasks from tasks_dir."""
-        tasks = []
+    def _load_tasks(self) -> tuple[list[Task], list[Task]]:
+        """
+        Load tasks from tasks_dir and split into train/eval sets.
+        
+        Returns:
+            Tuple of (train_tasks, eval_tasks)
+        """
+        all_tasks = []
         for task_dir in self.config.tasks_dir.iterdir():
             if task_dir.is_dir() and (task_dir / "task.toml").exists():
                 try:
-                    tasks.append(Task(task_dir=task_dir))
+                    all_tasks.append(Task(task_dir=task_dir))
                 except Exception as e:
                     logger.warning(f"Failed to load task from {task_dir}: {e}")
-        return tasks
+        
+        if not all_tasks:
+            return [], []
+        
+        # Sort tasks by task_id for reproducible splits
+        all_tasks.sort(key=lambda t: t.task_id)
+        
+        # Split based on config
+        if self.config.eval_tasks is not None:
+            # Use explicit eval task list
+            eval_task_ids = set(self.config.eval_tasks)
+            eval_tasks = [t for t in all_tasks if t.task_id in eval_task_ids]
+            train_tasks = [t for t in all_tasks if t.task_id not in eval_task_ids]
+            logger.info(f"Using explicit eval tasks: {len(eval_tasks)} eval, {len(train_tasks)} train")
+        elif self.config.eval_split > 0:
+            # Use proportional split
+            n_eval = max(1, int(len(all_tasks) * self.config.eval_split))
+            eval_tasks = all_tasks[:n_eval]
+            train_tasks = all_tasks[n_eval:]
+            logger.info(f"Split tasks: {len(train_tasks)} train ({1-self.config.eval_split:.1%}), "
+                       f"{len(eval_tasks)} eval ({self.config.eval_split:.1%})")
+        else:
+            # No eval split
+            train_tasks = all_tasks
+            eval_tasks = []
+            logger.info(f"No eval split: using all {len(train_tasks)} tasks for training")
+        
+        return train_tasks, eval_tasks

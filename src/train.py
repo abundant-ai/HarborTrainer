@@ -39,6 +39,20 @@ class CLIConfig:
     batch_size: int = chz.field(default=1, doc="Tasks per batch")
     group_size: int = chz.field(default=8, doc="Rollouts per task (GRPO group size)")
     n_epochs: int = chz.field(default=1, doc="Number of epochs")
+    
+    # Train/Eval split
+    eval_split: float = chz.field(
+        default=0.2,
+        doc="Fraction of tasks for evaluation (0.0 = no eval, 0.2 = 20% eval)"
+    )
+    eval_tasks: list[str] | None = chz.field(
+        default=None,
+        doc="Specific task IDs for eval (overrides eval_split if provided)"
+    )
+    eval_group_size: int | None = chz.field(
+        default=None,
+        doc="Rollouts per task during eval (None = use group_size)"
+    )
 
     # RL hyperparameters
     loss_fn: Literal["importance_sampling", "ppo"] = chz.field(
@@ -150,6 +164,9 @@ async def run_training(config: CLIConfig) -> None:
         batch_size=config.batch_size,
         group_size=config.group_size,
         n_epochs=config.n_epochs,
+        eval_split=config.eval_split,
+        eval_tasks=config.eval_tasks,
+        eval_group_size=config.eval_group_size,
         loss_fn=config.loss_fn,
         num_substeps=config.num_substeps,
         remove_constant_reward_groups=config.remove_constant_reward_groups,
