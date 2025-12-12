@@ -177,10 +177,12 @@ def build_datums_from_trials(
 
     for group, group_advantages in zip(groups, advantages_per_group):
         for result, advantage in zip(group, group_advantages):
-            if not result.rollout_details:
+            # Use only [0] to get main agent's rollout - subagent rollouts (e.g., summarization)
+            # are appended after and should be excluded since they're part of the "environment"
+            if not result.agent_result or not result.agent_result.rollout_details:
                 continue
 
-            rd = result.rollout_details[0]  # Main agent rollout
+            rd = result.agent_result.rollout_details[0]  # Main agent rollout only
             prompt_tokens = rd.get("prompt_token_ids", [])
             completion_tokens = rd.get("completion_token_ids", [])
             logprobs = rd.get("logprobs", [])
@@ -278,8 +280,8 @@ def compute_batch_metrics(groups: list[TrialGroup]) -> Metrics:
 
     n_turns_list = []
     for r in all_results:
-        if r.rollout_details:
-            n_turns_list.append(len(r.rollout_details[0].get("completion_token_ids", [])))
+        if r.agent_result and r.agent_result.rollout_details:
+            n_turns_list.append(len(r.agent_result.rollout_details[0].get("completion_token_ids", [])))
 
     return {
         "n_groups": len(groups),
@@ -294,7 +296,9 @@ class Terminus2RLTrainer:
     """
     RL trainer using Harbor's Trial infrastructure directly.
     
-    Uses TrialResult.rollout_details - no intermediate types needed.
+    Uses TrialResult.agent_result.rollout_details for training data.
+    Only the main agent's rollout (index 0) is used - subagent rollouts
+    (e.g., context summarization) are excluded as they're part of the environment.
     """
 
     def __init__(self, config: TrainerConfig):
@@ -427,7 +431,7 @@ class Terminus2RLTrainer:
                 logger.error(f"Trial exception for {task.task_id}: {r}")
             elif r is None:
                 logger.warning(f"Trial returned None for {task.task_id}")
-            elif not r.rollout_details:
+            elif not r.agent_result or not r.agent_result.rollout_details:
                 logger.warning(f"No rollout details for {task.task_id}")
             else:
                 valid.append(r)
