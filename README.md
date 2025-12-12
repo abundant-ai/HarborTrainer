@@ -48,7 +48,7 @@ terminal-bench-2/
 
 ```bash
 python -m src.train \
-  model_name=deepseek-ai/DeepSeek-V3.1  \
+  model_name=moonshotai/Kimi-K2-Thinking  \
   tasks_dir=./datasets/terminal-bench-2 \
   learning_rate=2e-4 \
   batch_size=1 \
@@ -65,8 +65,8 @@ python -m src.train \
   normalize_advantages_by_std=true \
   loss_fn=ppo \
   environment_type=docker \
-  wandb_project=train-ds \
-  wandb_name=ds-run
+  wandb_project=harbor-training \
+  wandb_name=test-run
 ```
 
 or `bash run.sh`
