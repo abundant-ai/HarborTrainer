@@ -209,6 +209,19 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     docker login
 fi
 
+
+cd datasets/
+
+curl -L -o extract_parquet_tasks.py \
+  "https://huggingface.co/datasets/open-thoughts/OpenThoughts-Agent-v1-RL/raw/main/extract_parquet_tasks.py"
+
+curl -L -o tasks.parquet \
+  "https://huggingface.co/datasets/open-thoughts/OpenThoughts-Agent-v1-RL/resolve/main/tasks.parquet"
+
+python extract_parquet_tasks.py tasks.parquet ./extracted_tasks
+
+cd ../
+
 # Final instructions
 echo -e "\n${GREEN}✅ Setup complete!${NC}"
 echo -e "\nNext steps:"

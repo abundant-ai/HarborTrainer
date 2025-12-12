@@ -3,7 +3,10 @@
 # Start vLLM server for inference (used with skyrl-tx training)
 #
 # Usage:
-#   ./scripts/start_vllm.sh                         # Qwen3-4B on GPU 0
+#   Terminal 1: ./scripts/start_vllm.sh                    # Runs on GPU 1 (default)
+#   Terminal 2: ./scripts/run_skyrl_tx.sh                  # Runs on GPU 0 (default)
+#
+# Advanced:
 #   ./scripts/start_vllm.sh Qwen/Qwen3-8B 2 "0,1"   # Qwen3-8B tensor-parallel=2 on GPUs 0,1
 #   ./scripts/start_vllm.sh Qwen/Qwen3-30B-A3B 4 "0,1,2,3"  # MoE on 4 GPUs
 #
@@ -15,7 +18,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 MODEL_NAME="${1:-Qwen/Qwen3-4B}"
 TP_SIZE="${2:-1}"
-GPU_IDS="${3:-${GPU_IDS:-0}}"
+GPU_IDS="${3:-1}"  # Default: GPU 1 for vLLM (GPU 0 reserved for training)
 PORT="${VLLM_PORT:-8001}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 MAX_LORA_RANK="${MAX_LORA_RANK:-32}"
@@ -29,12 +32,14 @@ echo "Starting vLLM inference server"
 echo "=============================================="
 echo "Model: ${MODEL_NAME}"
 echo "Tensor Parallel Size: ${TP_SIZE}"
-echo "CUDA_VISIBLE_DEVICES: ${GPU_IDS}"
+echo "GPU(s): ${GPU_IDS}"
 echo "Port: ${PORT}"
 echo "Max Model Length: ${MAX_MODEL_LEN}"
 echo "Max LoRA Rank: ${MAX_LORA_RANK}"
 echo "LoRA Directory: ${LORA_DIR}"
 echo "=============================================="
+echo ""
+echo "NOTE: Using GPU ${GPU_IDS} for vLLM (GPU 0 reserved for training)"
 echo ""
 
 # Enable dynamic LoRA loading via filesystem resolver

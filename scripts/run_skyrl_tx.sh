@@ -2,11 +2,12 @@
 #
 # Run training with skyrl-tx backend (uses vLLM for inference)
 #
-# PREREQUISITES:
-#   Terminal 1: ./scripts/start_vllm.sh
-#   Terminal 2: ./scripts/run_skyrl_tx.sh
+# USAGE (2-GPU setup):
+#   Terminal 1: ./scripts/start_vllm.sh       # Starts vLLM on GPU 1
+#   Terminal 2: ./scripts/run_skyrl_tx.sh     # Starts training on GPU 0
 #
-# This script automatically starts skyrl-tx in the background.
+# This script automatically starts skyrl-tx in the background on GPU 0.
+# GPU assignments are baked into the scripts for optimal 2-GPU setup.
 #
 
 set -e
@@ -20,23 +21,26 @@ ulimit -n 65536
 # The tinker SDK requires TINKER_API_KEY to be set, but skyrl-tx ignores it
 export TINKER_API_KEY="local"
 
-# Configuration
+# Configuration - GPU assignments for 2-GPU setup
+SKYRL_TX_GPUS="0"  # GPU 0 for training (skyrl-tx + training script)
+TRAIN_GPUS="0"     # GPU 0 for training script (must match skyrl-tx)
+# NOTE: vLLM should run on GPU 1 (see start_vllm.sh)
+
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3-4B}"
 TP_SIZE="${TP_SIZE:-1}"
 VLLM_URL="${VLLM_URL:-http://localhost:8001}"
 SKYRL_TX_URL="${SKYRL_TX_URL:-http://localhost:8000}"
 LORA_DIR="${LORA_DIR:-/tmp/lora_models}"
-TRAIN_GPUS="${TRAIN_GPUS:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKYRL_TX_DIR="${SCRIPT_DIR}/../SkyRL/skyrl-tx"
 
 echo "=============================================="
-echo "Training with skyrl-tx + vLLM"
+echo "Training with skyrl-tx + vLLM (2-GPU Setup)"
 echo "=============================================="
 echo "Model: ${MODEL_NAME}"
-echo "vLLM URL: ${VLLM_URL}"
-echo "Training CUDA_VISIBLE_DEVICES: ${TRAIN_GPUS}"
+echo "vLLM URL: ${VLLM_URL} (expected on GPU 1)"
+echo "Training GPU: ${SKYRL_TX_GPUS} (skyrl-tx + training)"
 echo "=============================================="
 echo ""
 
@@ -50,26 +54,25 @@ if ! curl -s "${VLLM_URL}/health" > /dev/null 2>&1; then
 fi
 echo "✓ vLLM server is running"
 
-# Pin training to specific GPU(s) to avoid contention with vLLM
-export CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}"
-
 # Start skyrl-tx in background if not already running
+# NOTE: Do NOT set CUDA_VISIBLE_DEVICES globally here - we set it per-process below
 if curl -s "${SKYRL_TX_URL}/api/v1/healthz" > /dev/null 2>&1; then
     echo "✓ skyrl-tx server already running"
 else
     echo "Starting skyrl-tx server in background..."
     
-    # JAX memory allocation
-    export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.45}"
+    # JAX memory allocation - 85% to leave headroom for peak memory usage
+    export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.85}"
     
     cd "$SKYRL_TX_DIR"
-    uv run --extra tinker --extra gpu python -m tx.tinker.api \
+    # Pin skyrl-tx to specific GPU(s) - MUST be different from vLLM GPU(s)!
+    CUDA_VISIBLE_DEVICES="${SKYRL_TX_GPUS}" uv run --extra tinker --extra gpu python -m tx.tinker.api \
         --base-model "${MODEL_NAME}" \
         --tensor-parallel-size "${TP_SIZE}" \
         --max-lora-rank 32 \
         --port 8000 \
         --gradient-checkpointing \
-        --train-micro-batch-size 2 \
+        --train-micro-batch-size 1 \
         --external-inference-url "${VLLM_URL}" \
         --external-inference-lora-base "${LORA_DIR}" \
         > /tmp/skyrl_tx.log 2>&1 &
@@ -108,7 +111,8 @@ echo ""
 # Run training
 cd "$SCRIPT_DIR/.."
 
-python -m src.train \
+# Pin training script to specific GPU(s) - usually same as skyrl-tx
+CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" uv run python -m src.train \
   backend=skyrl-tx \
   skyrl_tx_url=${SKYRL_TX_URL} \
   model_name=${MODEL_NAME} \
