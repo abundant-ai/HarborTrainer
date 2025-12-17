@@ -429,6 +429,21 @@ def main():
         default=Path("/tmp/harbor-prime-rl"),
         help="Path to trials directory (default: /tmp/harbor-prime-rl)"
     )
+    parser.add_argument(
+        "--since",
+        type=str,
+        default=None,
+        help="Only include trials modified since this time (e.g., '1h' for 1 hour, '30m' for 30 minutes, or ISO timestamp)"
+    )
+    parser.add_argument(
+        "--current-run",
+        type=Path,
+        nargs="?",
+        const=Path("prime-rl/outputs/harbor-8b-lora"),
+        default=None,
+        metavar="OUTPUT_DIR",
+        help="Only include trials from the current run (detects start time from orchestrator log). Optionally specify output dir."
+    )
     
     args = parser.parse_args()
     
@@ -438,9 +453,75 @@ def main():
         print(f"Error: Trials directory not found: {trials_dir}")
         sys.exit(1)
     
+    # Parse --current-run argument (takes precedence over --since)
+    min_mtime = None
+    if args.current_run:
+        # Find orchestrator log to detect run start time
+        orch_log = args.current_run / "logs" / "orchestrator.stdout"
+        if not orch_log.exists():
+            # Try relative to workspace
+            orch_log = Path.cwd() / args.current_run / "logs" / "orchestrator.stdout"
+        
+        if orch_log.exists():
+            import os
+            # On Linux, use Birth time from stat command (st_birthtime not available in Python)
+            try:
+                result = os.popen(f"stat -c %W '{orch_log}' 2>/dev/null").read().strip()
+                if result and result != '0':
+                    min_mtime = float(result) - 30  # 30 sec buffer
+            except:
+                pass
+            
+            # Fallback: parse first timestamp from log
+            if not min_mtime:
+                import re
+                try:
+                    with open(orch_log) as f:
+                        content = f.read(2000)
+                        match = re.search(r'\[2m(\d{2}):(\d{2}):(\d{2})\[0m', content)
+                        if match:
+                            h, m, s = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                            today = datetime.now().date()
+                            run_start = datetime.combine(today, datetime.min.time().replace(hour=h, minute=m, second=s))
+                            min_mtime = run_start.timestamp() - 30
+                except:
+                    pass
+            
+            # Last fallback: use ctime
+            if not min_mtime:
+                min_mtime = orch_log.stat().st_ctime
+            
+            print(f"Filtering to current run (started {datetime.fromtimestamp(min_mtime).strftime('%Y-%m-%d %H:%M:%S')})")
+        else:
+            print(f"Warning: Could not find orchestrator log at {orch_log}")
+            print("Falling back to all trials")
+    
+    # Parse --since argument
+    elif args.since:
+        if args.since.endswith('h'):
+            hours = float(args.since[:-1])
+            min_mtime = datetime.now().timestamp() - (hours * 3600)
+        elif args.since.endswith('m'):
+            minutes = float(args.since[:-1])
+            min_mtime = datetime.now().timestamp() - (minutes * 60)
+        else:
+            try:
+                min_mtime = datetime.fromisoformat(args.since).timestamp()
+            except ValueError:
+                print(f"Error: Invalid --since format: {args.since}")
+                print("Use '1h' for 1 hour, '30m' for 30 minutes, or ISO timestamp")
+                sys.exit(1)
+        print(f"Filtering to trials since {datetime.fromtimestamp(min_mtime).strftime('%Y-%m-%d %H:%M:%S')}")
+    
     # Get recent trials
+    all_trial_dirs = [d for d in trials_dir.iterdir() if d.is_dir()]
+    
+    # Filter by time if --since or --current-run is specified
+    if min_mtime:
+        all_trial_dirs = [d for d in all_trial_dirs if d.stat().st_mtime >= min_mtime]
+    
     trial_dirs = sorted(
-        [d for d in trials_dir.iterdir() if d.is_dir()],
+        all_trial_dirs,
         key=lambda x: x.stat().st_mtime,
         reverse=True
     )[:args.num_trials]
