@@ -22,7 +22,7 @@ output_dir = "prime-rl/outputs/harbor-8b-lora"
 
 # Logging
 [wandb]
-project = "harbor-rl"
+project = "harbor-training"
 name = "harbor-8b-lora"
 
 # Model - change to your preferred 8B model
@@ -41,12 +41,12 @@ lr = 1e-5
 # Orchestrator configuration
 [orchestrator]
 # batch_size must be divisible by rollouts_per_example
-batch_size = 32
-rollouts_per_example = 4
+batch_size = 4
+rollouts_per_example = 8
 # seq_len should accommodate multi-turn agent trajectories
 seq_len = 8192
 # max_concurrent controls parallel env generations
-max_concurrent = 4
+max_concurrent = 32
 
 # Sampling configuration for vLLM
 [orchestrator.sampling]
@@ -67,10 +67,10 @@ tasks_dir = "harbor_tasks/extracted_tasks"
 environment_type = "docker"
 
 # Maximum agent turns per trial
-max_turns = 20
+max_turns = 100000
 
 # Parallel trial execution limit (should match orchestrator.max_concurrent)
-n_parallel_envs = 4
+n_parallel_envs = 32
 
 # Context summarization for models with limited context window
 # Enable for 8B models, disable for larger models with 32k+ context
