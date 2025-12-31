@@ -18,17 +18,20 @@ from harbor.trial.trial import Trial
 from tinker.types import LossFnType
 from tinker_cookbook.model_info import get_recommended_renderer_name
 from tinker_cookbook.renderers import get_renderer
-from tinker_cookbook.rl.train import (
-    forward_backward as cookbook_forward_backward,
-    optim_step as cookbook_optim_step,
+from tinker_cookbook.rl.metrics import (
+    compute_kl_sample_train,
 )
 from tinker_cookbook.rl.metrics import (
     incorporate_kl_penalty as cookbook_incorporate_kl_penalty,
-    compute_kl_sample_train,
 )
-from tinker_cookbook.tokenizer_utils import get_tokenizer
+from tinker_cookbook.rl.train import (
+    forward_backward as cookbook_forward_backward,
+)
+from tinker_cookbook.rl.train import (
+    optim_step as cookbook_optim_step,
+)
 from tinker_cookbook.utils import ml_log
-from tinker_cookbook.utils.misc_utils import split_list, timed, all_same
+from tinker_cookbook.utils.misc_utils import all_same, split_list, timed
 
 from src.tinker_llm import TinkerLLM
 
@@ -62,7 +65,9 @@ class TrainerConfig:
 
     # Train/Eval split
     eval_split: float = 0.2  # Fraction of tasks to use for evaluation (0.0 = no eval)
-    eval_tasks: list[str] | None = None  # Optional: specific task IDs for eval (overrides eval_split)
+    eval_tasks: list[str] | None = (
+        None  # Optional: specific task IDs for eval (overrides eval_split)
+    )
     eval_group_size: int | None = None  # Rollouts per task during eval (None = use group_size)
 
     # RL hyperparameters
@@ -74,7 +79,9 @@ class TrainerConfig:
     normalize_advantages_by_std: bool = True  # Divide advantages by std
 
     # KL regularization against reference model
-    kl_penalty_coef: float = 0.0  # KL penalty coefficient (0 = disabled, default off due to multi-turn bugs)
+    kl_penalty_coef: float = (
+        0.0  # KL penalty coefficient (0 = disabled, default off due to multi-turn bugs)
+    )
 
     # Agent configuration
     max_turns: int | None = None
@@ -85,7 +92,9 @@ class TrainerConfig:
 
     # Context summarization (enables parity with Terminus 2 evaluation)
     enable_summarize: bool = True  # Enable context summarization when context is full
-    proactive_summarization_threshold: int = 2000  # Trigger summarization when free tokens below this
+    proactive_summarization_threshold: int = (
+        2000  # Trigger summarization when free tokens below this
+    )
 
     # Environment configuration
     environment_type: str = "docker"
@@ -115,11 +124,11 @@ def compute_grpo_advantages(
 ) -> tuple[list[list[float]], Metrics]:
     """
     Compute GRPO-style advantages: center rewards within each group.
-    
+
     Args:
         groups: List of trial groups (each group = multiple rollouts for same task)
         normalize_by_std: If True, divide by std
-    
+
     Returns:
         Tuple of (advantages per group, metrics dict)
     """
@@ -131,9 +140,9 @@ def compute_grpo_advantages(
         if not rewards:
             all_advantages.append([])
             continue
-        
+
         mean_reward = sum(rewards) / len(rewards)
-        
+
         if normalize_by_std and len(rewards) > 1:
             # Compute std for normalization (like SkyRL)
             std_reward = statistics.stdev(rewards)
@@ -143,7 +152,7 @@ def compute_grpo_advantages(
         else:
             # Simple mean centering (original behavior)
             advantages = [r - mean_reward for r in rewards]
-        
+
         all_advantages.append(advantages)
 
     # Compute metrics about advantage distribution
@@ -160,12 +169,12 @@ def compute_grpo_advantages(
 
 
 def build_datums_from_trials(
-        groups: list[TrialGroup],
-        advantages_per_group: list[list[float]],
+    groups: list[TrialGroup],
+    advantages_per_group: list[list[float]],
 ) -> list[tinker.Datum]:
     """
     Build tinker.Datum directly from TrialResult rollout_details.
-    
+
     Tinker expects causal LM format where all arrays have the same length:
     - model_input: full_sequence[:-1] (prompt + completion, minus last token)
     - target_tokens: full_sequence[1:] (shifted by 1 position)
@@ -216,49 +225,45 @@ def build_datums_from_trials(
 
                 # Concatenate prompt + completion to form full sequence
                 full_sequence = turn_prompt + turn_completion
-                
+
                 if len(full_sequence) < 2:
                     continue
-                
+
                 # Causal LM format: input is all but last, target is shifted by 1
                 input_tokens = full_sequence[:-1]
                 target_tokens = full_sequence[1:]
-                
+
                 n_prompt = len(turn_prompt)
                 n_completion = len(turn_completion)
-                seq_len = len(input_tokens)  # = len(full_sequence) - 1
-                
+
                 # Build logprobs array:
                 # - Positions 0 to n_prompt-2: predicting prompt tokens (no logprobs, use 0)
                 # - Position n_prompt-1: predicting first completion token (logprobs[0])
                 # - Positions n_prompt to seq_len-1: predicting rest of completion (logprobs[1:])
                 full_logprobs = [0.0] * (n_prompt - 1) + turn_logprobs
-                
+
                 # Build advantages array: 0 for prompt positions, normalized_advantage for completion
                 full_advantages = [0.0] * (n_prompt - 1) + [normalized_advantage] * n_completion
-                
+
                 # Build mask: 0 for prompt positions, 1 for completion positions
                 full_mask = [0.0] * (n_prompt - 1) + [1.0] * n_completion
-                
+
                 # Verify lengths match
-                assert len(input_tokens) == len(target_tokens) == len(full_logprobs) == len(full_advantages) == len(full_mask), \
-                    f"Length mismatch: input={len(input_tokens)}, target={len(target_tokens)}, logprobs={len(full_logprobs)}, advantages={len(full_advantages)}, mask={len(full_mask)}"
+                assert (
+                    len(input_tokens)
+                    == len(target_tokens)
+                    == len(full_logprobs)
+                    == len(full_advantages)
+                    == len(full_mask)
+                ), f"Length mismatch: input={len(input_tokens)}, target={len(target_tokens)}, logprobs={len(full_logprobs)}, advantages={len(full_advantages)}, mask={len(full_mask)}"
 
                 datum = tinker.Datum(
                     model_input=tinker.ModelInput.from_ints(tokens=input_tokens),
                     loss_fn_inputs={
-                        "target_tokens": tinker.TensorData.from_torch(
-                            torch.tensor(target_tokens)
-                        ),
-                        "logprobs": tinker.TensorData.from_torch(
-                            torch.tensor(full_logprobs)
-                        ),
-                        "advantages": tinker.TensorData.from_torch(
-                            torch.tensor(full_advantages)
-                        ),
-                        "mask": tinker.TensorData.from_torch(
-                            torch.tensor(full_mask)
-                        ),
+                        "target_tokens": tinker.TensorData.from_torch(torch.tensor(target_tokens)),
+                        "logprobs": tinker.TensorData.from_torch(torch.tensor(full_logprobs)),
+                        "advantages": tinker.TensorData.from_torch(torch.tensor(full_advantages)),
+                        "mask": tinker.TensorData.from_torch(torch.tensor(full_mask)),
                     },
                 )
                 datums.append(datum)
@@ -281,7 +286,9 @@ def compute_batch_metrics(groups: list[TrialGroup]) -> Metrics:
     n_turns_list = []
     for r in all_results:
         if r.agent_result and r.agent_result.rollout_details:
-            n_turns_list.append(len(r.agent_result.rollout_details[0].get("completion_token_ids", [])))
+            n_turns_list.append(
+                len(r.agent_result.rollout_details[0].get("completion_token_ids", []))
+            )
 
     return {
         "n_groups": len(groups),
@@ -295,7 +302,7 @@ def compute_batch_metrics(groups: list[TrialGroup]) -> Metrics:
 class Terminus2RLTrainer:
     """
     RL trainer using Harbor's Trial infrastructure directly.
-    
+
     Uses TrialResult.agent_result.rollout_details for training data.
     Only the main agent's rollout (index 0) is used - subagent rollouts
     (e.g., context summarization) are excluded as they're part of the environment.
@@ -318,7 +325,7 @@ class Terminus2RLTrainer:
         # Suppress verbose Harbor logs at the module level
         logging.getLogger("harbor").setLevel(logging.WARNING)
         logging.getLogger("harbor.utils.logger").setLevel(logging.WARNING)
-        
+
         self._service_client = tinker.ServiceClient(base_url=self.config.tinker_base_url)
 
         if hasattr(self._service_client, "create_lora_training_client_async"):
@@ -337,21 +344,25 @@ class Terminus2RLTrainer:
         renderer_name = get_recommended_renderer_name(self.config.model_name)
         self._renderer = get_renderer(renderer_name, self._tokenizer)
 
-        self._sampling_client = await self._training_client.save_weights_and_get_sampling_client_async(
-            name="initial"
+        self._sampling_client = (
+            await self._training_client.save_weights_and_get_sampling_client_async(name="initial")
         )
-        
+
         # Store frozen reference model for KL penalty
         if self.config.kl_penalty_coef > 0:
-            self._base_sampling_client = await self._training_client.save_weights_and_get_sampling_client_async(
-                name="reference_base"
+            self._base_sampling_client = (
+                await self._training_client.save_weights_and_get_sampling_client_async(
+                    name="reference_base"
+                )
             )
             logger.info(f"KL regularization enabled with coef={self.config.kl_penalty_coef}")
 
         self._semaphore = asyncio.Semaphore(self.config.n_parallel_envs)
         self._batch_count = 0
         logger.info(f"Initialized Terminus2RLTrainer with model {self.config.model_name}")
-        logger.info(f"Loss function: {self.config.loss_fn}, Std normalization: {self.config.normalize_advantages_by_std}")
+        logger.info(
+            f"Loss function: {self.config.loss_fn}, Std normalization: {self.config.normalize_advantages_by_std}"
+        )
 
     def _create_llm(self) -> TinkerLLM:
         """Factory function to create TinkerLLM instances."""
@@ -418,7 +429,7 @@ class Terminus2RLTrainer:
     async def _run_group(self, task: Task) -> TrialGroup:
         """Run multiple trials for same task (GRPO grouping)."""
         logger.info(f"    Running {self.config.group_size} trials for task: {task.name}")
-        
+
         results = await asyncio.gather(
             *[self._run_trial(task) for _ in range(self.config.group_size)],
             return_exceptions=True,
@@ -437,13 +448,15 @@ class Terminus2RLTrainer:
                 valid.append(r)
                 reward = extract_reward(r.verifier_result)
                 rewards.append(reward)
-        
+
         # Log summary of results
         if rewards:
             avg_reward = sum(rewards) / len(rewards)
             max_reward = max(rewards)
-            logger.info(f"    Task {task.name}: {len(valid)}/{self.config.group_size} valid trials, "
-                       f"avg_reward={avg_reward:.3f}, max_reward={max_reward:.3f}")
+            logger.info(
+                f"    Task {task.name}: {len(valid)}/{self.config.group_size} valid trials, "
+                f"avg_reward={avg_reward:.3f}, max_reward={max_reward:.3f}"
+            )
         else:
             logger.warning(f"    Task {task.name}: No valid trials completed")
 
@@ -453,7 +466,7 @@ class Terminus2RLTrainer:
         """Run trials for a batch of tasks."""
         # Suppress Harbor logs before running trials (in case new loggers were created)
         self._suppress_harbor_logs()
-        
+
         groups = await asyncio.gather(
             *[self._run_group(task) for task in tasks],
             return_exceptions=True,
@@ -474,9 +487,7 @@ class Terminus2RLTrainer:
         """Accumulate gradients on a minibatch."""
         if self._training_client is None:
             raise RuntimeError("Trainer not initialized")
-        return await cookbook_forward_backward(
-            self._training_client, data, self.config.loss_fn
-        )
+        return await cookbook_forward_backward(self._training_client, data, self.config.loss_fn)
 
     async def _optim_step(self) -> None:
         """Apply accumulated gradients."""
@@ -487,30 +498,29 @@ class Terminus2RLTrainer:
     async def eval_batch(self, tasks: list[Task]) -> dict[str, Any]:
         """
         Evaluate on a batch of tasks without training.
-        
+
         Uses eval_group_size if set, otherwise uses group_size.
         """
         # Temporarily override group_size for eval if eval_group_size is set
         original_group_size = self.config.group_size
         if self.config.eval_group_size is not None:
             self.config.group_size = self.config.eval_group_size
-        
+
         try:
             # Collect trials (no training)
             groups = await self._run_batch(tasks)
-            
+
             if not groups:
                 return {"error": "All trial groups failed"}
-            
+
             # Compute metrics only (no training)
             episode_metrics = compute_batch_metrics(groups)
-            
+
             # Optionally compute advantages for analysis
             advantages, advantage_metrics = compute_grpo_advantages(
-                groups,
-                normalize_by_std=self.config.normalize_advantages_by_std
+                groups, normalize_by_std=self.config.normalize_advantages_by_std
             )
-            
+
             return {
                 **episode_metrics,
                 **advantage_metrics,
@@ -531,8 +541,7 @@ class Terminus2RLTrainer:
         # Optionally remove constant reward groups (no gradient when all same)
         if self.config.remove_constant_reward_groups:
             groups = [
-                g for g in groups
-                if not all_same([extract_reward(r.verifier_result) for r in g])
+                g for g in groups if not all_same([extract_reward(r.verifier_result) for r in g])
             ]
             if not groups:
                 return {"error": "All groups had constant rewards"}
@@ -542,8 +551,7 @@ class Terminus2RLTrainer:
 
         # Step 2: Compute GRPO advantages (with optional std normalization)
         advantages, advantage_metrics = compute_grpo_advantages(
-            groups, 
-            normalize_by_std=self.config.normalize_advantages_by_std
+            groups, normalize_by_std=self.config.normalize_advantages_by_std
         )
 
         # Step 3: Build Datums from TrialResult
@@ -573,10 +581,10 @@ class Terminus2RLTrainer:
             for batch in minibatches:
                 batch_logprobs = await self._forward_backward(batch)
                 training_logprobs_D.extend(batch_logprobs)
-        
+
         with timed("optim_step", timing_metrics):
             await self._optim_step()
-        
+
         # Compute KL between sampling and training (measures staleness)
         optim_metrics = compute_kl_sample_train(datums, training_logprobs_D)
 
@@ -584,9 +592,7 @@ class Terminus2RLTrainer:
             raise RuntimeError("Trainer not initialized")
 
         checkpoint_due = (self._batch_count + 1) % self.config.save_every == 0
-        checkpoint_name = (
-            f"checkpoint_{self._batch_count + 1:06d}" if checkpoint_due else "latest"
-        )
+        checkpoint_name = f"checkpoint_{self._batch_count + 1:06d}" if checkpoint_due else "latest"
 
         self._sampling_client = (
             await self._training_client.save_weights_and_get_sampling_client_async(
@@ -615,7 +621,7 @@ class Terminus2RLTrainer:
                 harbor_logger.setLevel(logging.WARNING)
                 # Also disable propagation to prevent logs from bubbling up
                 harbor_logger.propagate = False
-    
+
     async def train(self) -> None:
         """Main training loop."""
         await self.setup()
@@ -631,7 +637,9 @@ class Terminus2RLTrainer:
         self._suppress_harbor_logs()
 
         train_tasks, eval_tasks = self._load_tasks()
-        logger.info(f"Loaded {len(train_tasks)} train tasks, {len(eval_tasks)} eval tasks from {self.config.tasks_dir}")
+        logger.info(
+            f"Loaded {len(train_tasks)} train tasks, {len(eval_tasks)} eval tasks from {self.config.tasks_dir}"
+        )
 
         if not train_tasks:
             logger.error("No train tasks found")
@@ -645,9 +653,11 @@ class Terminus2RLTrainer:
 
             # Training loop
             for i in range(0, len(train_tasks), self.config.batch_size):
-                batch_tasks = train_tasks[i: i + self.config.batch_size]
+                batch_tasks = train_tasks[i : i + self.config.batch_size]
                 batch_num = i // self.config.batch_size + 1
-                total_batches = (len(train_tasks) + self.config.batch_size - 1) // self.config.batch_size
+                total_batches = (
+                    len(train_tasks) + self.config.batch_size - 1
+                ) // self.config.batch_size
 
                 logger.info(f"  Train Batch {batch_num}/{total_batches}")
 
@@ -665,65 +675,64 @@ class Terminus2RLTrainer:
             if eval_tasks:
                 logger.info(f"  Running evaluation on {len(eval_tasks)} tasks...")
                 eval_metrics_list = []
-                
+
                 for i in range(0, len(eval_tasks), self.config.batch_size):
-                    batch_tasks = eval_tasks[i: i + self.config.batch_size]
+                    batch_tasks = eval_tasks[i : i + self.config.batch_size]
                     batch_num = i // self.config.batch_size + 1
-                    total_batches = (len(eval_tasks) + self.config.batch_size - 1) // self.config.batch_size
-                    
+                    total_batches = (
+                        len(eval_tasks) + self.config.batch_size - 1
+                    ) // self.config.batch_size
+
                     logger.info(f"  Eval Batch {batch_num}/{total_batches}")
-                    
+
                     eval_metrics = await self.eval_batch(batch_tasks)
                     eval_metrics["epoch"] = epoch + 1
                     eval_metrics["batch"] = batch_num
                     eval_metrics["split"] = "eval"
-                    
+
                     logger.info(f"    Eval Metrics: {eval_metrics}")
                     eval_metrics_list.append(eval_metrics)
-                
+
                 # Aggregate eval metrics
                 if eval_metrics_list:
                     agg_eval_metrics = self._aggregate_eval_metrics(eval_metrics_list)
                     agg_eval_metrics["epoch"] = epoch + 1
                     agg_eval_metrics["split"] = "eval_aggregated"
-                    
+
                     logger.info(f"  Epoch {epoch + 1} Eval Summary: {agg_eval_metrics}")
-                    
+
                     if self._ml_logger:
                         self._ml_logger.log_metrics(agg_eval_metrics, step=self._batch_count)
 
         if self._ml_logger:
             self._ml_logger.close()
-    
+
     def _aggregate_eval_metrics(self, metrics_list: list[dict[str, Any]]) -> dict[str, Any]:
         """Aggregate evaluation metrics across batches."""
         if not metrics_list:
             return {}
-        
+
         # Count total episodes
         total_episodes = sum(m.get("n_episodes", 0) for m in metrics_list)
-        
+
         if total_episodes == 0:
             return {"error": "No episodes in eval"}
-        
+
         # Weighted average of metrics
         agg = {}
         for key in ["mean_reward", "success_rate", "mean_turns"]:
-            weighted_sum = sum(
-                m.get(key, 0) * m.get("n_episodes", 0)
-                for m in metrics_list
-            )
+            weighted_sum = sum(m.get(key, 0) * m.get("n_episodes", 0) for m in metrics_list)
             agg[key] = weighted_sum / total_episodes
-        
+
         agg["n_episodes"] = total_episodes
         agg["n_batches"] = len(metrics_list)
-        
+
         return agg
 
     def _load_tasks(self) -> tuple[list[Task], list[Task]]:
         """
         Load tasks from tasks_dir and split into train/eval sets.
-        
+
         Returns:
             Tuple of (train_tasks, eval_tasks)
         """
@@ -734,31 +743,35 @@ class Terminus2RLTrainer:
                     all_tasks.append(Task(task_dir=task_dir))
                 except Exception as e:
                     logger.warning(f"Failed to load task from {task_dir}: {e}")
-        
+
         if not all_tasks:
             return [], []
-        
+
         # Sort tasks by name for reproducible splits
         all_tasks.sort(key=lambda t: t.name)
-        
+
         # Split based on config
         if self.config.eval_tasks is not None:
             # Use explicit eval task list
             eval_task_ids = set(self.config.eval_tasks)
             eval_tasks = [t for t in all_tasks if t.name in eval_task_ids]
             train_tasks = [t for t in all_tasks if t.name not in eval_task_ids]
-            logger.info(f"Using explicit eval tasks: {len(eval_tasks)} eval, {len(train_tasks)} train")
+            logger.info(
+                f"Using explicit eval tasks: {len(eval_tasks)} eval, {len(train_tasks)} train"
+            )
         elif self.config.eval_split > 0:
             # Use proportional split
             n_eval = max(1, int(len(all_tasks) * self.config.eval_split))
             eval_tasks = all_tasks[:n_eval]
             train_tasks = all_tasks[n_eval:]
-            logger.info(f"Split tasks: {len(train_tasks)} train ({1-self.config.eval_split:.1%}), "
-                       f"{len(eval_tasks)} eval ({self.config.eval_split:.1%})")
+            logger.info(
+                f"Split tasks: {len(train_tasks)} train ({1-self.config.eval_split:.1%}), "
+                f"{len(eval_tasks)} eval ({self.config.eval_split:.1%})"
+            )
         else:
             # No eval split
             train_tasks = all_tasks
             eval_tasks = []
             logger.info(f"No eval split: using all {len(train_tasks)} tasks for training")
-        
+
         return train_tasks, eval_tasks

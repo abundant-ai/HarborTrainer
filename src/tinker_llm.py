@@ -41,14 +41,14 @@ class TinkerLLM(BaseLLM, BaseModel):
     _renderer: Renderer = PrivateAttr()
 
     def __init__(
-            self,
-            sampling_client: tinker.SamplingClient,
-            tokenizer: Tokenizer,
-            renderer: Renderer,
-            model_name: str,
-            max_tokens: int,
-            temperature: float,
-            context_limit: int,
+        self,
+        sampling_client: tinker.SamplingClient,
+        tokenizer: Tokenizer,
+        renderer: Renderer,
+        model_name: str,
+        max_tokens: int,
+        temperature: float,
+        context_limit: int,
     ):
         """
         Initialize TinkerLLM.
@@ -88,10 +88,10 @@ class TinkerLLM(BaseLLM, BaseModel):
         return self.context_limit
 
     async def call(
-            self,
-            prompt: str,
-            message_history: list[dict[str, Any]] | None = None,
-            **kwargs,
+        self,
+        prompt: str,
+        message_history: list[dict[str, Any]] | None = None,
+        **kwargs,
     ) -> LLMResponse:
         """
         Sample from Tinker and return an LLMResponse.
@@ -141,9 +141,7 @@ class TinkerLLM(BaseLLM, BaseModel):
         # Extract from response
         sampled_seq = result.sequences[0]
         completion_tokens = list(sampled_seq.tokens)
-        completion_logprobs = (
-            list(sampled_seq.logprobs) if sampled_seq.logprobs else None
-        )
+        completion_logprobs = list(sampled_seq.logprobs) if sampled_seq.logprobs else None
 
         if completion_logprobs is None:
             raise LogprobsMissingError(

@@ -18,4 +18,3 @@ docker network prune -f
 
 echo "Docker cleanup complete!"
 echo "Current container count: $(docker ps -a | wc -l)"
-

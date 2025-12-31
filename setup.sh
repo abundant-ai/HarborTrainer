@@ -16,14 +16,14 @@ echo -e "\n${GREEN}[1/6] Checking for uv...${NC}"
 if ! command -v uv &> /dev/null; then
     echo "Installing uv..."
     curl -LsSf https://astral.sh/uv/install.sh | sh
-    
+
     # Add uv to PATH - try common locations
     if [ -f "$HOME/.cargo/bin/uv" ]; then
         export PATH="$HOME/.cargo/bin:$PATH"
     elif [ -f "$HOME/.local/bin/uv" ]; then
         export PATH="$HOME/.local/bin:$PATH"
     fi
-    
+
     # Verify uv is now available
     if ! command -v uv &> /dev/null; then
         echo "Error: uv was installed but not found in PATH"
@@ -113,4 +113,3 @@ echo -e "       tasks_dir=./terminal-bench-2 \\"
 echo -e "       wandb_project=train-qwen \\"
 echo -e "       wandb_name=qwen-run${NC}"
 echo -e "\nFor more information, see README.md"
-

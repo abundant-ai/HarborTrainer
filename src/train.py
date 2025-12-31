@@ -39,19 +39,16 @@ class CLIConfig:
     batch_size: int = chz.field(default=1, doc="Tasks per batch")
     group_size: int = chz.field(default=8, doc="Rollouts per task (GRPO group size)")
     n_epochs: int = chz.field(default=1, doc="Number of epochs")
-    
+
     # Train/Eval split
     eval_split: float = chz.field(
-        default=0.2,
-        doc="Fraction of tasks for evaluation (0.0 = no eval, 0.2 = 20% eval)"
+        default=0.2, doc="Fraction of tasks for evaluation (0.0 = no eval, 0.2 = 20% eval)"
     )
     eval_tasks: list[str] | None = chz.field(
-        default=None,
-        doc="Specific task IDs for eval (overrides eval_split if provided)"
+        default=None, doc="Specific task IDs for eval (overrides eval_split if provided)"
     )
     eval_group_size: int | None = chz.field(
-        default=None,
-        doc="Rollouts per task during eval (None = use group_size)"
+        default=None, doc="Rollouts per task during eval (None = use group_size)"
     )
 
     # RL hyperparameters
@@ -151,7 +148,9 @@ async def run_training(config: CLIConfig) -> None:
     logger.info(f"Environment: {config.environment_type} (n_parallel={config.n_parallel_envs})")
     logger.info(f"Batch size: {config.batch_size}, Group size: {config.group_size}")
     logger.info(f"Loss function: {config.loss_fn}, Substeps: {config.num_substeps}")
-    logger.info(f"Context summarization: {config.enable_summarize} (threshold: {config.proactive_summarization_threshold})")
+    logger.info(
+        f"Context summarization: {config.enable_summarize} (threshold: {config.proactive_summarization_threshold})"
+    )
     logger.info("=" * 60)
 
     trainer_config = TrainerConfig(
@@ -200,20 +199,20 @@ def main() -> None:
         level=logging.WARNING,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-    
+
     # Enable INFO logs only for our own modules
     logging.getLogger("__main__").setLevel(logging.INFO)
     logging.getLogger("src.terminus2_trainer").setLevel(logging.INFO)
     logging.getLogger("src.tinker_llm").setLevel(logging.INFO)
-    
+
     # Keep tinker-cookbook at INFO for training metrics
     logging.getLogger("tinker_cookbook.utils.ml_log").setLevel(logging.INFO)
-    
+
     # Suppress verbose Harbor logs (Docker/environment operations)
     # Harbor uses its own logger system - suppress all Harbor loggers
     logging.getLogger("harbor").setLevel(logging.WARNING)
     logging.getLogger("harbor.utils.logger").setLevel(logging.WARNING)
-    
+
     # Also suppress all child loggers that might be created by Harbor
     for name in list(logging.Logger.manager.loggerDict.keys()):
         if name.startswith("harbor"):
